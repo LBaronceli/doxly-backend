@@ -18,10 +18,6 @@ dist/
 *.swp
 *.swo
 
-# Dependency caches
-go.sum
-**/vendor/
-
 # Local environment files
 *.env
 deploy/local/env/*.env
