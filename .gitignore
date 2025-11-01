@@ -1,0 +1,39 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+app
+
+# Go build artifact directories
+bin/
+dist/
+
+# IDE junk
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dependency caches
+go.sum
+**/vendor/
+
+# Local environment files
+*.env
+deploy/local/env/*.env
+
+# Docker volumes (if accidentally created)
+docker-volume/
+
+# MacOS / Linux / Windows trash
+.DS_Store
+Thumbs.db
+
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/

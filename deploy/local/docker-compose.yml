@@ -1,0 +1,52 @@
+version: "3.9"
+name: doxly
+services:
+  postgres:
+    image: postgres:16
+    env_file: ./env/postgres.env
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-11T00-00-00Z
+    env_file: ./env/minio.env
+    command: server /data --console-address ":9001"
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio:/data"]
+
+  auth:
+    build:
+      context: ../../
+      dockerfile: services/auth-service/Dockerfile
+    env_file: ./env/auth.env
+    depends_on: [postgres]
+    ports: ["8081:8080"]
+
+  customer:
+    build:
+      context: ../../
+      dockerfile: services/customer-api/Dockerfile
+    env_file: ./env/customer.env
+    depends_on: [postgres, auth]
+    ports: ["8082:8080"]
+
+  attachments:
+    build:
+      context: ../../
+      dockerfile: services/attachments-service/Dockerfile
+    env_file: ./env/attachments.env
+    depends_on: [minio, auth, customer]
+    ports: ["8083:8080"]
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  minio: {}
