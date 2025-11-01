@@ -1,16 +1,28 @@
 name: doxly
+
 services:
   postgres:
     image: postgres:16
     env_file: ./env/postgres.env
-    ports: ["5432:5432"]
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h localhost",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
 
   redis:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes"]
-    ports: ["6379:6379"]
+    ports:
+      - "6379:6379"
     volumes:
       - redisdata:/data
 
@@ -18,51 +30,93 @@ services:
     image: minio/minio:latest
     env_file: ./env/minio.env
     command: server /data --console-address ":9001"
-    ports: ["9000:9000", "9001:9001"]
-    volumes: ["minio:/data"]
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO console
+    volumes:
+      - minio:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
 
-  # one-shot init to create the doxly bucket
+  # one-shot: create the doxly bucket and allow anonymous read for convenience
   minio-setup:
     image: minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
+    env_file: ./env/minio.env
     entrypoint: >
       /bin/sh -c "
       /usr/bin/mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
       /usr/bin/mc mb -p local/doxly || true &&
       /usr/bin/mc anonymous set download local/doxly || true
       "
-    env_file: ./env/minio.env
+
+  # optional: run DB migrations on demand:
+  #   cd deploy/local && docker compose run --rm migrator
+  migrator:
+    image: migrate/migrate:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../../db/migrations:/migrations
+    entrypoint:
+      [
+        "migrate",
+        "-path",
+        "/migrations",
+        "-database",
+        "postgres://postgres:postgres@postgres:5432/doxly?sslmode=disable",
+        "up",
+      ]
 
   auth:
     build:
       context: ../../
       dockerfile: services/auth-service/Dockerfile
     env_file: ./env/auth.env
-    depends_on: [postgres]
-    ports: ["8081:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+    # NOTE: no healthcheck here because distroless image has no shell/curl;
+    # we handle DB readiness with retry logic inside the app.
 
   customer:
     build:
       context: ../../
       dockerfile: services/customer-api/Dockerfile
     env_file: ./env/customer.env
-    depends_on: [postgres, auth]
-    ports: ["8082:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth:
+        condition: service_started
+    ports:
+      - "8082:8080"
+    restart: unless-stopped
 
   attachments:
     build:
       context: ../../
       dockerfile: services/attachments-service/Dockerfile
     env_file: ./env/attachments.env
-    depends_on: [minio, minio-setup, auth, customer]
-    ports: ["8083:8080"]
+    depends_on:
+      auth:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      minio-setup:
+        condition: service_started
+    ports:
+      - "8083:8080"
+    restart: unless-stopped
 
 volumes:
   pgdata: {}

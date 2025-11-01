@@ -20,10 +20,31 @@ func main() {
 
 	port := envOr("PORT", "8080")
 
-	// same trick as customer-api for now: verify using public key from env
-	signer, err := auth.LoadEd25519FromEnv()
-	if err != nil { log.Fatalf("jwt keys: %v", err) }
-	verifier := auth.NewVerifier(signer.Public())
+	// Prefer JWKS; fallback to env keys
+	var verifier *auth.Verifier
+	if jwksURL := os.Getenv("AUTH_JWKS_URL"); jwksURL != "" {
+		// retry up to ~30 seconds in case auth isn't ready yet
+		for i := 0; i < 20; i++ {
+			pub, _, err := auth.FetchEd25519FromJWKS(jwksURL)
+			if err == nil {
+				verifier = auth.NewVerifier(pub)
+				log.Infof("attachments-service: using JWKS verifier: %s", jwksURL)
+				break
+			}
+			time.Sleep(1500 * time.Millisecond)
+		}
+		if verifier == nil {
+			log.Fatalf("jwks fetch failed after retries")
+		}
+	} else {
+		signer, err := auth.LoadEd25519FromEnv()
+		if err != nil {
+			log.Fatalf("jwt keys: %v", err)
+		}
+		verifier = auth.NewVerifier(signer.Public())
+		log.Infof("attachments-service: using env public key (fallback)")
+	}
+
 
 	r := chi.NewRouter()
 	r.Handle("/metrics", telemetry.MetricsHandler())
