@@ -1,0 +1,284 @@
+{
+  "info": {
+    "name": "Doxly Local",
+    "_postman_id": "c3cb3d3d-2a0b-4b09-8a0e-67a4a9f5e9aa",
+    "description": "Auth, Customer API and Attachments flows running locally via docker-compose.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "auth_base", "value": "http://localhost:8081" },
+    { "key": "customer_base", "value": "http://localhost:8082" },
+    { "key": "attachments_base", "value": "http://localhost:8083" },
+    { "key": "email", "value": "admin+postman@acme.test" },
+    { "key": "password", "value": "changeme123" },
+    { "key": "org_name", "value": "Acme Inc" },
+    { "key": "token", "value": "" },
+    { "key": "user_id", "value": "" },
+    { "key": "org_id", "value": "" },
+    { "key": "customer_id", "value": "" },
+    { "key": "presigned_url", "value": "" },
+    { "key": "object_key", "value": "" },
+    { "key": "filename", "value": "hello.txt" },
+    { "key": "content_type", "value": "text/plain" },
+    { "key": "size_bytes", "value": "12" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Auth /healthz",
+          "request": { "method": "GET", "url": "{{auth_base}}/healthz" }
+        },
+        {
+          "name": "Auth /.well-known/jwks.json",
+          "request": {
+            "method": "GET",
+            "url": "{{auth_base}}/.well-known/jwks.json"
+          }
+        },
+        {
+          "name": "Auth signup (returns token)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{auth_base}}/v1/signup",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\",\n  \"org_name\": \"{{org_name}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "let json = {};\n",
+                  "try { json = pm.response.json(); } catch(e) {}\n",
+                  "if (json.token) {",
+                  "  pm.collectionVariables.set('token', json.token);",
+                  "}\n",
+                  "pm.test('Signup status 201/200', function () {",
+                  "  pm.expect(pm.response.code).to.be.oneOf([200,201]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Auth login (returns token)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{auth_base}}/v1/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "let json = {};\n",
+                  "try { json = pm.response.json(); } catch(e) {}\n",
+                  "if (json.token) {",
+                  "  pm.collectionVariables.set('token', json.token);",
+                  "}\n",
+                  "pm.test('Login status 200', function () {",
+                  "  pm.expect(pm.response.code).to.eql(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Auth /v1/me (extract org_id & user_id)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{auth_base}}/v1/me"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "let json = {};\n",
+                  "try { json = pm.response.json(); } catch(e) {}\n",
+                  "if (json.org_id) pm.collectionVariables.set('org_id', json.org_id);",
+                  "if (json.user_id) pm.collectionVariables.set('user_id', json.user_id);",
+                  "pm.test('Me status 200', function () {",
+                  "  pm.expect(pm.response.code).to.eql(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Customer API",
+      "item": [
+        {
+          "name": "Customer /healthz",
+          "request": { "method": "GET", "url": "{{customer_base}}/healthz" }
+        },
+        {
+          "name": "Create customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": "{{customer_base}}/v1/customers",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Bruce Wayne\",\n  \"email\": \"bruce@wayne.enterprises\",\n  \"phone\": \"+1-555-1234\",\n  \"notes\": \"VIP\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "let json = {};\n",
+                  "try { json = pm.response.json(); } catch(e) {}\n",
+                  "if (json.id) pm.collectionVariables.set('customer_id', json.id);\n",
+                  "pm.test('Create status 201/200', function () {",
+                  "  pm.expect(pm.response.code).to.be.oneOf([200,201]);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "List customers",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{customer_base}}/v1/customers?limit=10"
+          }
+        },
+        {
+          "name": "Get customer by id",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{customer_base}}/v1/customers/{{customer_id}}"
+          }
+        },
+        {
+          "name": "Update customer",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": "{{customer_base}}/v1/customers/{{customer_id}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Bruce W.\",\n  \"notes\": \"updated\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete customer",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{customer_base}}/v1/customers/{{customer_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Attachments",
+      "item": [
+        {
+          "name": "Attachments /healthz",
+          "request": { "method": "GET", "url": "{{attachments_base}}/healthz" }
+        },
+        {
+          "name": "Presign (PUT) for upload",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": "{{attachments_base}}/v1/customers/{{customer_id}}/attachments/presign",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"filename\": \"{{filename}}\",\n  \"content_type\": \"{{content_type}}\",\n  \"size\": {{size_bytes}}\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "let json = {};\n",
+                  "try { json = pm.response.json(); } catch(e) {}\n",
+                  "if (json.url) pm.collectionVariables.set('presigned_url', json.url);\n",
+                  "if (json.object_key) pm.collectionVariables.set('object_key', json.object_key);\n",
+                  "pm.test('Presign status 200', function () {",
+                  "  pm.expect(pm.response.code).to.eql(200);",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Upload via presigned URL (PUT to MinIO/S3)",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "{{content_type}}" }],
+            "url": "{{presigned_url}}",
+            "body": {
+              "mode": "file",
+              "file": { "src": "" }
+            },
+            "description": "Select a file in the UI. If you want exact-size match, pick a file whose byte size equals {{size_bytes}} (or adjust {{size_bytes}} before confirm)."
+          }
+        },
+        {
+          "name": "Confirm upload",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": "{{attachments_base}}/v1/customers/{{customer_id}}/attachments/confirm",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"object_key\": \"{{object_key}}\",\n  \"filename\": \"{{filename}}\",\n  \"content_type\": \"{{content_type}}\",\n  \"size\": {{size_bytes}}\n}"
+            }
+          }
+        },
+        {
+          "name": "List attachments",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{attachments_base}}/v1/customers/{{customer_id}}/attachments?limit=10"
+          }
+        }
+      ]
+    }
+  ]
+}

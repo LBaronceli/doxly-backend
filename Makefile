@@ -40,3 +40,5 @@ migrate:
 	  -path=/migrations \
 	  -database 'postgres://postgres:postgres@postgres:5432/doxly?sslmode=disable' \
 	  up
+e2e:
+	bash scripts/e2e_local.sh

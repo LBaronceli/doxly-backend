@@ -34,11 +34,11 @@ func main() {
 
 	port := envOr("PORT", "8080")
 
-	// Open DB (with retry inside MustOpen)
+	// Open DB (retry logic is inside MustOpen)
 	sqlxDB := db.MustOpen(context.Background(), "DATABASE_URL")
 	defer sqlxDB.Close()
 
-	// Load JWT signer (auth is the issuer)
+	// Auth is the issuer: load Ed25519 signer from env
 	signer, err := auth.LoadEd25519FromEnv()
 	if err != nil {
 		log.Fatalf("jwt keys: %v", err)
@@ -65,8 +65,13 @@ func main() {
 	// Auth API
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/signup", s.handleSignup)
-		r.Post("/login", s.handleLogin) // to be implemented
-		r.Get("/me", s.handleMe)        // to be implemented
+		r.Post("/login", s.handleLogin)
+
+		// Protected subrouter: requires Bearer token
+		r.Group(func(pr chi.Router) {
+			pr.Use(s.jwtVerifierMiddleware())
+			pr.Get("/me", s.handleMe)
+		})
 	})
 
 	// Common middlewares (logger, recoverer, requestID, etc.)
@@ -172,11 +177,159 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	httpJSON(w, http.StatusCreated, signupResp{Token: tok})
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	httpJSON(w, http.StatusNotImplemented, map[string]string{"error": "not implemented"})
+/* ===================== /v1/login ===================== */
+
+type loginReq struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
+type loginResp struct {
+	Token string `json:"token"`
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var in loginReq
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		httpJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	if email == "" || in.Password == "" {
+		httpJSON(w, http.StatusBadRequest, map[string]string{"error": "missing email/password"})
+		return
+	}
+
+	// Look up user by email
+	var userID, orgID, role, pwHash string
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	err := s.db.QueryRowContext(ctx,
+		`select id, org_id, role, password_hash from users where lower(email) = $1`,
+		email,
+	).Scan(&userID, &orgID, &role, &pwHash)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return
+		}
+		s.log.Errorf("login query error: %v", err)
+		httpJSON(w, http.StatusInternalServerError, map[string]string{"error": "server error"})
+		return
+	}
+
+	if bcrypt.CompareHashAndPassword([]byte(pwHash), []byte(in.Password)) != nil {
+		httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
+	}
+
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"sub":    userID,
+		"org_id": orgID,
+		"role":   role,
+		"iat":    now.Unix(),
+		"exp":    now.Add(24 * time.Hour).Unix(),
+		"iss":    "doxly-auth",
+		"aud":    "doxly",
+	}
+	tok, err := s.signer.Sign(claims)
+	if err != nil {
+		httpJSON(w, http.StatusInternalServerError, map[string]string{"error": "sign token"})
+		return
+	}
+	httpJSON(w, http.StatusOK, loginResp{Token: tok})
+}
+
+/* ===================== /v1/me (protected) ===================== */
+
+type meResp struct {
+	UserID string `json:"user_id"`
+	OrgID  string `json:"org_id"`
+	Role   string `json:"role"`
+	Email  string `json:"email"`
+}
+
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
-	httpJSON(w, http.StatusNotImplemented, map[string]string{"error": "not implemented"})
+	claims := getClaims(r)
+	userID, _ := claims["sub"].(string)
+	orgID, _ := claims["org_id"].(string)
+
+	// Fetch fresh data (so we return current email/role)
+	var email, role string
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	err := s.db.QueryRowContext(ctx,
+		`select email, role from users where id = $1 and org_id = $2`,
+		userID, orgID,
+	).Scan(&email, &role)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+			return
+		}
+		s.log.Errorf("me query error: %v", err)
+		httpJSON(w, http.StatusInternalServerError, map[string]string{"error": "server error"})
+		return
+	}
+
+	httpJSON(w, http.StatusOK, meResp{
+		UserID: userID,
+		OrgID:  orgID,
+		Role:   role,
+		Email:  email,
+	})
+}
+
+/* ===================== middleware & helpers ===================== */
+
+func (s *Server) jwtVerifierMiddleware() func(http.Handler) http.Handler {
+	public := s.signer.Public()
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ah := r.Header.Get("Authorization")
+			if !strings.HasPrefix(strings.ToLower(ah), "bearer ") {
+				httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer token"})
+				return
+			}
+			tokenStr := strings.TrimSpace(ah[len("Bearer "):])
+
+			claims := jwt.MapClaims{}
+			tok, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (any, error) {
+				if token.Method.Alg() != jwt.SigningMethodEdDSA.Alg() {
+					return nil, jwt.ErrTokenUnverifiable
+				}
+				return public, nil
+			})
+			if err != nil || !tok.Valid {
+				httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+				return
+			}
+
+			// Light audience/issuer checks
+			if aud, _ := claims["aud"].(string); aud != "doxly" {
+				httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad audience"})
+				return
+			}
+			if iss, _ := claims["iss"].(string); iss != "doxly-auth" {
+				httpJSON(w, http.StatusUnauthorized, map[string]string{"error": "bad issuer"})
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), ctxClaimsKey{}, claims)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+type ctxClaimsKey struct{}
+
+func getClaims(r *http.Request) jwt.MapClaims {
+	if v := r.Context().Value(ctxClaimsKey{}); v != nil {
+		if c, ok := v.(jwt.MapClaims); ok {
+			return c
+		}
+	}
+	return jwt.MapClaims{}
 }
 
 func httpJSON(w http.ResponseWriter, code int, v any) {
