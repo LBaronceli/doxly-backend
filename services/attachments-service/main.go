@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,8 +34,10 @@ type Server struct {
 	log        *zap.SugaredLogger
 	dbx        *sqlx.DB
 	pub        ed25519.PublicKey
-	// Internal MinIO/S3 client for server-side ops (StatObject, etc.)
+
+	// Internal MinIO/S3 client for server-side ops (StatObject, GetObject, etc.)
 	minio *minio.Client
+
 	// Presign client that targets the exact hostname clients will call
 	presign    *minio.Client
 	bucket     string
@@ -126,7 +129,7 @@ func main() {
 	// Presign client: must use the EXACT host clients will call (SigV4 includes host)
 	var presignMC *minio.Client
 	if pubBase := os.Getenv("MINIO_PUBLIC_BASE"); pubBase != "" {
-		u, err := url.Parse(pubBase) // e.g., http://localhost:9000 or https://s3.yourdomain.com
+		u, err := url.Parse(pubBase) // e.g., http://localhost:9000 or https://files.example.com
 		if err != nil {
 			log.Fatalf("MINIO_PUBLIC_BASE parse error: %v", err)
 		}
@@ -179,14 +182,22 @@ func main() {
 	r.Route("/v1", func(r chi.Router) {
 		r.Group(func(pr chi.Router) {
 			pr.Use(s.jwtVerifierMiddleware())
+
+			// Upload flow
 			pr.Post("/customers/{id}/attachments/presign", s.handlePresign)
 			pr.Post("/customers/{id}/attachments/confirm", s.handleConfirm)
 			pr.Get("/customers/{id}/attachments", s.handleList)
+
+			// Download URL (presigned GET)
+			pr.Get("/customers/{id}/attachments/{attachment_id}/download-url", s.handleDownloadURL)
+
+			// OPTIONAL: proxy/stream download via API (comment in if desired)
+			// pr.Get("/customers/{id}/attachments/{attachment_id}/download", s.handleDownloadStream)
 		})
 	})
 
 	h := httpx.Common(r)
-	log.Infof("attachments-service listening on :%s", port)
+	s.log.Infof("attachments-service listening on :%s", port)
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      h,
@@ -194,7 +205,7 @@ func main() {
 		WriteTimeout: 15 * time.Second,
 	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("server: %v", err)
+		s.log.Fatalf("server: %v", err)
 	}
 }
 
@@ -267,7 +278,7 @@ type Attachment struct {
 	Filename    string    `db:"filename" json:"filename"`
 	ContentType *string   `db:"content_type" json:"content_type,omitempty"`
 	SizeBytes   *int64    `db:"size_bytes" json:"size_bytes,omitempty"`
-	ETag        *string   `db:"etag" json:"etag,omitempty"` // aligns with DB column 'etag'
+	ETag        *string   `db:"etag" json:"etag,omitempty"`
 	UploadedBy  string    `db:"uploaded_by" json:"uploaded_by"`
 	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 }
@@ -304,6 +315,16 @@ func (s *Server) listAttachments(ctx context.Context, customerID string, limit, 
 		limit $2 offset $3
 	`, customerID, limit, offset)
 	return out, err
+}
+
+func (s *Server) getAttachment(ctx context.Context, attachmentID string) (Attachment, error) {
+	var a Attachment
+	err := s.dbx.GetContext(ctx, &a, `
+		select id, org_id, customer_id, object_key, filename, content_type, size_bytes, etag, uploaded_by, created_at
+		from attachments
+		where id=$1
+	`, attachmentID)
+	return a, err
 }
 
 /* ========= handlers ========= */
@@ -418,8 +439,8 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 		Filename:    in.Filename,
 		ContentType: in.ContentType,
 		SizeBytes:   &size,
-		ETag:        etag,      // store ETag
-		UploadedBy:  uploader,  // from JWT sub
+		ETag:        etag,     // store ETag
+		UploadedBy:  uploader, // from JWT sub
 	})
 	if err != nil {
 		s.fail(w, r, http.StatusInternalServerError, "confirm failed (db)", err, "object_key", in.ObjectKey)
@@ -461,4 +482,106 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		"limit":  limit,
 		"offset": offset,
 	})
+}
+
+/* ========= download handlers ========= */
+
+type downloadURLResp struct {
+	URL string `json:"url"`
+}
+
+// GET /v1/customers/{id}/attachments/{attachment_id}/download-url?disposition=attachment|inline
+func (s *Server) handleDownloadURL(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := orgFromJWT(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	customerID := chi.URLParam(r, "id")
+	attachmentID := chi.URLParam(r, "attachment_id")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	// Fetch row + tenancy check
+	a, err := s.getAttachment(ctx, attachmentID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		s.fail(w, r, http.StatusInternalServerError, "load attachment", err, "attachment_id", attachmentID)
+		return
+	}
+	if a.OrgID != orgID || a.CustomerID != customerID {
+		httpJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return
+	}
+
+	// Optional: content-disposition + type
+	disp := r.URL.Query().Get("disposition")
+	if disp == "" {
+		disp = "attachment"
+	}
+
+	reqParams := make(url.Values)
+	reqParams.Set("response-content-disposition", fmt.Sprintf(`%s; filename="%s"`, disp, a.Filename))
+	if a.ContentType != nil && *a.ContentType != "" {
+		reqParams.Set("response-content-type", *a.ContentType)
+	}
+
+	// Presign GET
+	getURL, err := s.presign.PresignedGetObject(ctx, s.bucket, a.ObjectKey, 5*time.Minute, reqParams)
+	if err != nil {
+		s.fail(w, r, http.StatusInternalServerError, "presign get", err, "attachment_id", attachmentID)
+		return
+	}
+	httpJSON(w, http.StatusOK, downloadURLResp{URL: getURL.String()})
+}
+
+// OPTIONAL: stream through API instead of exposing MinIO host
+// GET /v1/customers/{id}/attachments/{attachment_id}/download
+func (s *Server) handleDownloadStream(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := orgFromJWT(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	customerID := chi.URLParam(r, "id")
+	attachmentID := chi.URLParam(r, "attachment_id")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	a, err := s.getAttachment(ctx, attachmentID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		s.fail(w, r, http.StatusInternalServerError, "load attachment", err, "attachment_id", attachmentID)
+		return
+	}
+	if a.OrgID != orgID || a.CustomerID != customerID {
+		httpJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return
+	}
+
+	obj, err := s.minio.GetObject(ctx, s.bucket, a.ObjectKey, minio.GetObjectOptions{})
+	if err != nil {
+		s.fail(w, r, http.StatusInternalServerError, "get object", err, "attachment_id", attachmentID)
+		return
+	}
+	defer obj.Close()
+
+	if a.ContentType != nil && *a.ContentType != "" {
+		w.Header().Set("Content-Type", *a.ContentType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, a.Filename))
+
+	if _, err := io.Copy(w, obj); err != nil {
+		s.log.Warnf("stream copy error: %v", err)
+	}
 }
